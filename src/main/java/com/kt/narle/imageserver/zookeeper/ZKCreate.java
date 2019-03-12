@@ -1,5 +1,6 @@
 package com.kt.narle.imageserver.zookeeper;
 
+import com.kt.narle.imageserver.exception.ZKException;
 import lombok.Getter;
 import lombok.Setter;
 import org.apache.zookeeper.*;
@@ -29,93 +30,77 @@ public class ZKCreate { //service
     @Autowired
     private ZooKeeperConnection conn;
 
-    public void createZNode(String path, byte [] data) throws KeeperException, InterruptedException {
-        this.conn.getZoo().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
-    }
-
-    public Stat isExists(String path) throws KeeperException, InterruptedException {
-        return this.conn.getZoo().exists(path, true);
-    }
-
-    public String getData(String path) throws InterruptedException, KeeperException {
+    /**
+     * zookeeper getData, multi-thread synchronized
+     * @param path
+     * @return
+     * @throws InterruptedException
+     * @throws KeeperException
+     */
+    public synchronized String getData(String path) throws InterruptedException, KeeperException {
         final CountDownLatch connectedSignal = new CountDownLatch(1);
         byte[] bData = null;
-        stat = isExists(path);
+        stat = Optional.ofNullable(isExists(path))
+                .orElseThrow(() -> new ZKException("ZNode가 존재하지 않습니다"));
 
         try {
-            if (stat != null) { //zkNode가 있다면
-                bData = this.conn.getZoo().getData(path, watchedEvent -> {
+            bData = this.conn.getZoo().getData(path, watchedEvent -> {
 
-                    if (watchedEvent.getType() == Watcher.Event.EventType.None) {
-                        switch (watchedEvent.getState()) {
-                            case Expired:
-                                connectedSignal.countDown();
-                                break;
-                        }
-                    } else {// 무언가 이벤트 발생시
-                    /*
-                    Watcher.Event.EventType.NodeCreated
-                    Watcher.Event.EventType.NodeDataChanged
-                    Watcher.Event.EventType.NodeDeleted
-                    Watcher.Event.EventType.NodeChildrenChanged 등
-                     */
-                        try {
-                            byte[] bn = conn.getZoo().getData(path, false, null);
-                            String data = new String(bn, "UTF-8");
-//                            System.out.println("DATA: " + data);
+                if (watchedEvent.getType() == Watcher.Event.EventType.None) {
+                    switch (watchedEvent.getState()) {
+                        case Expired:
                             connectedSignal.countDown();
-
-                        } catch (Exception e) {
-                            System.out.println(e.getMessage());
-                        }
+                            break;
                     }
-                }, stat);
-            }else
-            {
-                throw new RuntimeException("zkNode가 존재하지 않습니다");
-            }
+                } else {/*Watcher.Event.EventType.NodeCreated, Watcher.Event.EventType.NodeDataChanged
+                          Watcher.Event.EventType.NodeDeleted
+                          Watcher.Event.EventType.NodeChildrenChanged 등 이벤트 발생시
+                          zookeeper cluster가 없어 아직 사용하지 않음.*/
+                    try {
+                        byte[] bn = conn.getZoo().getData(path, false, null);
+                        String data = new String(bn, "UTF-8");
+                        connectedSignal.countDown();
+                    } catch (Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+                }}, stat);
+        } catch(KeeperException e){
+            throw new ZKException("getData Error : " + e.getMessage());
         }
-        catch(KeeperException e){
-            throw new RuntimeException(e.getMessage());
-        }
-
-        String data = "";
-        try {
-            data = new String(bData, "UTF-8");
-        }catch(UnsupportedEncodingException e) {
-            data = "false";
-        }
-        return data;
+        return byteArrayToString(bData);
     }
 
-    public String getMinKeyFromZookeeper(String path) throws KeeperException, InterruptedException{
-        //path에 쓰여진 데이터중 가장 작은 key값을 리턴한다. key는 ip:port다.
+    /**
+     * zookeeper로부터 가장 작은 서버를 가져옴. multi-thread synchronized
+     * @param path
+     * @return path에 쓰여진 데이터중 가장 작은 key값을 리턴한다. key는 ip:port다.
+     * @throws KeeperException
+     * @throws InterruptedException
+     */
+    public synchronized String getMinKeyFromZookeeper(String path) throws KeeperException, InterruptedException{
         String whole_data = Optional.ofNullable(this.getData(path)).
-                                    orElseThrow(() -> new RuntimeException("data가 없습니다"));
+                orElseThrow(() -> new ZKException("Data가 없습니다"));
         StringTokenizer st = new StringTokenizer(whole_data,"\n");
         String [] urlAndCount = st.nextToken().split(" ");
-        if(Integer.valueOf(urlAndCount[1]) <= 20) {//data는 정렬되어져 있음. 0번째 데이터만 확인하면 됌.
+        if(urlAndCount.length != 2) throw new ZKException("ZNode의 데이터가 정확하지 않습니다.");
+        if(Integer.valueOf(urlAndCount[1]) < 20) {//data는 정렬되어져 있음. 0번째 데이터만 확인
             return urlAndCount[0];
         }
         return "full";
-
-        /*
-        String key = "";
-        int min = Integer.MAX_VALUE;
-        while(st.hasMoreTokens()) {
-            String[] urlAndCount = st.nextToken().split(" ");
-            int count = Integer.valueOf(urlAndCount[1]);
-            if(count < min && count <= 10) { //10개 까지만.
-                min = count;
-                key = urlAndCount[0];
-            }
-        }
-        return key;
-        */
     }
-    public boolean update(HttpMethod httpMethod, String key, String path) throws KeeperException, InterruptedException {
+
+    /**
+     * zookeeper update, multi-thread synchronized
+     * @param httpMethod
+     * @param key
+     * @param path
+     * @return
+     * @throws KeeperException
+     * @throws InterruptedException
+     */
+    public synchronized boolean update(HttpMethod httpMethod, String key, String path) throws KeeperException, InterruptedException {
         String whole_data = this.getData(path);
-        LinkedHashMap<String, Integer> data_map = new LinkedHashMap<>(); //url / count
+        LinkedHashMap<String, Integer> data_map = new LinkedHashMap<>();
 
         if (whole_data != null) {
             if (whole_data.isEmpty()) {
@@ -130,38 +115,41 @@ public class ZKCreate { //service
                         });
 
                 if (data_map.containsKey(key)) {
-                    if (httpMethod == HttpMethod.POST) { //POST의 경우 :+1
+                    if (httpMethod.equals(HttpMethod.POST))  //POST의 경우 :+1
                         data_map.computeIfPresent(key, (k, v) -> v + 1);
-                    } else if (httpMethod == HttpMethod.GET) { //GET의 경우 response를 받아온 것 :-1
-                        data_map.computeIfPresent(key, (k, v) -> (v > 0 ? v - 1 : 0));
-                    }
-                } else { //최초로 들어온 url인 경우
-                    data_map.put(key, 0); //최초 데이터는 추가.
-                }
+                    else if (httpMethod.equals(HttpMethod.GET))  //GET의 경우 response를 받아온 것 :-1
+                        data_map.computeIfPresent(key, (k, v) -> (v > 0 ? v = v - 1 : 0));
+                } else
+                    data_map.put(key, 0); //최초로 들어온 url인 경우 최초 데이터는 추가.
             }
-        } else { //아예 ZNode도 없는경우는 만든다.
+        } else { //ZNode도 없는경우는 만든다.
             this.createZNode(path, (key + " " + "0").getBytes());
             return true;
         }
 
         try {
             this.conn.getZoo().setData(path, toByteArray(data_map), -1);
-            return true;
         } catch (Exception e) {
-            throw new RuntimeException("setData 오류 :" + e.getMessage());
+            throw new ZKException("setData 오류 :" + e.getMessage());
         }
+        return true;
     }
 
+    /**
+     * LinkedHashMap to Byte
+     * @param data_map
+     * @return
+     */
     public byte[] toByteArray(LinkedHashMap<String, Integer> data_map) {
         LinkedHashMap<String, Integer> sorted =
                 data_map.entrySet().stream()
-                                    .sorted(Map.Entry.comparingByValue())
-                                    .collect(Collectors.toMap(
-                                            Map.Entry::getKey,
-                                            Map.Entry::getValue,
-                                            (x,y) ->{ throw new AssertionError();},
-                                            LinkedHashMap::new
-                                    ));
+                        .sorted(Map.Entry.comparingByValue())
+                        .collect(Collectors.toMap(
+                                Map.Entry::getKey,
+                                Map.Entry::getValue,
+                                (x,y) ->{ throw new AssertionError();},
+                                LinkedHashMap::new
+                        ));
         Iterator<String> iterator = sorted.keySet().iterator();
         List<String> keyList = new ArrayList<>();
         iterator.forEachRemaining(keyList::add);
@@ -171,4 +159,40 @@ public class ZKCreate { //service
             value += keyList.get(i) + " " + sorted.get(keyList.get(i)) +"\n";
         return value.getBytes();
     }
+
+    /**
+     * byte[] to String
+     * @param bData
+     * @return
+     */
+    public String byteArrayToString(byte[] bData) {
+        try {
+            return new String(bData, "UTF-8");
+        }catch(UnsupportedEncodingException e){
+            throw new ZKException(e.getMessage());
+        }
+    }
+
+    /**
+     * ZNode생
+     * @param path
+     * @param data
+     * @throws KeeperException
+     * @throws InterruptedException
+     */
+    public void createZNode(String path, byte [] data) throws KeeperException, InterruptedException {
+        this.conn.getZoo().create(path, data, ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+    }
+
+    /**
+     * path에 ZNode가 존재하는지 여부
+     * @param path
+     * @return
+     * @throws KeeperException
+     * @throws InterruptedException
+     */
+    public Stat isExists(String path) throws KeeperException, InterruptedException {
+        return this.conn.getZoo().exists(path, true);
+    }
+
 }
