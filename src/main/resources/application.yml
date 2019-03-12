@@ -18,3 +18,14 @@ logging:
 
 server:
   port: 8080
+
+#server:
+#  port: 443
+#  ssl:
+#    key-store: /root/keystore.p12
+#    key-store-password: password?
+#    key-password: ?
+#    key-alias: tomcat
+#    key-store-type: PKCS12
+#    trust-store: /root/image-server.ts
+#    trust-store-password: password?
